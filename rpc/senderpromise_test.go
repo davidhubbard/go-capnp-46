@@ -2,6 +2,8 @@ package rpc_test
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"testing"
 
 	"capnproto.org/go/capnp/v3"
@@ -10,6 +12,7 @@ import (
 	"capnproto.org/go/capnp/v3/rpc/transport"
 	rpccp "capnproto.org/go/capnp/v3/std/capnp/rpc"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSenderPromiseFulfill(t *testing.T) {
@@ -213,4 +216,82 @@ type emptyShutdowner struct {
 
 func (s emptyShutdowner) Shutdown() {
 	close(s.onShutdown)
+}
+
+// Tests that E-order is respected when fulfilling a promise with something on
+// the remote peer.
+func TestPromiseOrdering(t *testing.T) {
+	//t.Parallel()
+	fmt.Fprintln(os.Stderr, "-- TestPromoseOrdering TOP --")
+	defer func (){ fmt.Fprintln(os.Stderr, "-- TestPromoseOrdering END --") }()
+
+	ctx := context.Background()
+	p, r := capnp.NewLocalPromise[testcapnp.PingPong]()
+	defer p.Release()
+
+	left, right := transport.NewPipe(1)
+	//p1, p2 := rpc.NewTransport(left), rpc.NewTransport(right)
+	p1, p2 := rpc.NewTransportDebug(left, "left"), rpc.NewTransportDebug(right, "right")
+
+	c1 := rpc.NewConn(p1, &rpc.Options{
+		ErrorReporter:   testErrorReporter{tb: t},
+		BootstrapClient: capnp.Client(p),
+	})
+	ord := &echoNumOrderChecker{
+		t: t,
+	}
+	c2 := rpc.NewConn(p2, &rpc.Options{
+		ErrorReporter:   testErrorReporter{tb: t},
+		BootstrapClient: capnp.Client(testcapnp.PingPong_ServerToClient(ord)),
+	})
+
+	c1Promise := testcapnp.PingPong(c1.Bootstrap(ctx))
+	defer c1Promise.Release()
+	c2Promise := testcapnp.PingPong(c2.Bootstrap(ctx))
+	defer c2Promise.Release()
+
+	// Send a whole bunch of calls to the promise:
+	var (
+		futures []testcapnp.PingPong_echoNum_Results_Future
+		rels    []capnp.ReleaseFunc
+	)
+	numCalls := 1024
+	for i := 0; i < numCalls; i++ {
+		fut, rel := echoNum(ctx, c2Promise, int64(i))
+		futures = append(futures, fut)
+		rels = append(rels, rel)
+
+		// At some arbitrary point in the middle, fulfill the promise
+		// with the other bootstrap interface:
+		if i == 100 {
+			go func() {
+				fmt.Fprintln(os.Stderr, "-- TestPromoseOrdering left:FULFILL --")
+				r.Fulfill(c1Promise)
+			}()
+		}
+	}
+	for i, fut := range futures {
+		// Verify that all the results are as expected. The server
+		// Will verify that they came in the right order.
+		res, err := fut.Struct()
+		require.NoError(t, err, fmt.Sprintf("call #%d should succeed", i))
+		require.Equal(t, int64(i), res.N())
+	}
+	for _, rel := range rels {
+		rel()
+	}
+
+	require.NoError(t, c2Promise.Resolve(ctx))
+	// Shut down the connections, and make sure we can still send
+	// calls. This ensures that we've successfully shortened the path to
+	// cut out the remote peer:
+	c1.Close()
+	c2.Close()
+	if false {	// path shortening is not implemented yet
+		fut, rel := echoNum(ctx, c2Promise, int64(numCalls))
+		defer rel()
+		res, err := fut.Struct()
+		require.NoError(t, err)
+		require.Equal(t, int64(numCalls), res.N())
+	}
 }

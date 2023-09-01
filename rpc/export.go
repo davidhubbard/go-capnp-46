@@ -118,14 +118,14 @@ func (c *lockedConn) sendCap(d rpccp.CapDescriptor, snapshot capnp.ClientSnapsho
 
 	defer snapshot.Release()
 	bv := snapshot.Brand().Value
-	if ic, ok := bv.(*importClient); ok {
-		if ic.c == (*Conn)(c) {
-			if ent := c.lk.imports[ic.id]; ent != nil && ent.generation == ic.generation {
-				d.SetReceiverHosted(uint32(ic.id))
+	if imp, ok := bv.(*impent); ok {
+		if imp.c == (*Conn)(c) {
+			if _, ok := c.lk.imports[imp.id]; ok {
+				d.SetReceiverHosted(uint32(imp.id))
 				return 0, false, nil
 			}
 		}
-		if c.network != nil && c.network == ic.c.network {
+		if c.network != nil && c.network == imp.c.network {
 			panic("TODO: 3PH")
 		}
 	}
@@ -304,7 +304,21 @@ func (e embargo) String() string {
 		"}"
 }
 
-// embargo creates a new embargoed client, stealing the reference.
+// embargo creates a new embargoed client, stealing client. The client is
+// stored in member 'q' for use as one of:
+//
+// * receiverLoopback: lift() will be called to resume the held promise on
+//   this end. 'q' is a promise that can be resumed locally.
+//
+// * senderLoopback with target = parsedMessageTarget{ which: promisedAnswer }:
+//   client.state.h is sent over the wire to the other end in the disembargo
+//   message. 'q' is a promise for the other end.
+//
+// * senderLoopback with importedCap: TODO: not implemented yet:
+//	target = parsedMessageTarget{
+//		which: rpccp.MessageTarget_Which_importedCap,
+//		importedCap: exportID(promiseID),
+//	}
 //
 // The caller must be holding onto c.mu.
 func (c *lockedConn) embargo(client capnp.Client) (embargoID, capnp.Client) {
@@ -363,8 +377,14 @@ func (e *embargo) Shutdown() {
 	e.client().Release()
 }
 
-// senderLoopback holds the salient information for a sender-loopback
-// Disembargo message.
+// senderLoopback is an internal struct for generating the
+// Disembargo message with:
+// * context = senderLoopback
+// * senderLoopback.id = the embargoID from this struct
+// * target = promisedAnswer
+// * promisedAnswer.questionId = the questionID from this struct
+//
+// This is only used in handleResolve() - see rpc.go
 type senderLoopback struct {
 	id        embargoID
 	question  questionID

@@ -4,6 +4,8 @@ package rpc // import "capnproto.org/go/capnp/v3/rpc"
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -603,7 +605,11 @@ func (c *Conn) receive(ctx context.Context) func() error {
 					return err
 				}
 
-			// TODO: handle resolve.
+			case rpccp.Message_Which_resolve:
+				if err := c.handleResolve(ctx, in); err != nil {
+					return err
+				}
+
 			case rpccp.Message_Which_accept, rpccp.Message_Which_provide:
 				if c.network != nil {
 					panic("TODO: 3PH")
@@ -1156,8 +1162,8 @@ func (c *Conn) handleReturn(ctx context.Context, in transport.IncomingMessage) e
 				// the embargo on our side, but doesn't cause a leak.
 				//
 				// TODO(soon): make embargo resolve to error client.
-				for _, s := range pr.disembargoes {
-					c.sendMessage(ctx, s.buildDisembargo, func(err error) {
+				for _, sl := range pr.disembargoes {
+					c.sendMessage(ctx, sl.buildDisembargo, func(err error) {
 						if err != nil {
 							err = exc.WrapError("incoming return: send disembargo", err)
 							c.er.ReportError(err)
@@ -1200,7 +1206,7 @@ func (c *lockedConn) parseReturn(dq *deferred.Queue, ret rpccp.Return, called []
 		if err != nil {
 			return parsedReturn{err: rpcerr.WrapFailed("parse return", err), parseFailed: true}
 		}
-		content, locals, err := c.recvPayload(dq, r)
+		content, disembargoSenders, err := c.recvPayload(dq, r)
 		if err != nil {
 			return parsedReturn{err: rpcerr.WrapFailed("parse return", err), parseFailed: true}
 		}
@@ -1212,7 +1218,7 @@ func (c *lockedConn) parseReturn(dq *deferred.Queue, ret rpccp.Return, called []
 			p2, _ := capnp.Transform(content, xform)
 			iface := p2.Interface()
 			i := iface.Capability()
-			if !mtab.Contains(iface) || !locals.has(uint(i)) || embargoCaps.has(uint(i)) {
+			if !mtab.Contains(iface) || !disembargoSenders.has(uint(i)) || embargoCaps.has(uint(i)) {
 				continue
 			}
 
@@ -1319,6 +1325,7 @@ func (c *lockedConn) recvCap(d rpccp.CapDescriptor) (capnp.Client, error) {
 		return capnp.Client{}, nil
 	case rpccp.CapDescriptor_Which_senderHosted:
 		id := importID(d.SenderHosted())
+		fmt.Fprintln(os.Stderr, fmt.Sprintf("recvCap senderHosted id=%v", id))
 		return c.addImport(id), nil
 	case rpccp.CapDescriptor_Which_senderPromise:
 		// We do the same thing as senderHosted, above. @kentonv suggested this on
@@ -1332,6 +1339,7 @@ func (c *lockedConn) recvCap(d rpccp.CapDescriptor) (capnp.Client, error) {
 		// >   messages sent to it will uselessly round-trip over the network
 		// >   rather than being delivered locally.
 		id := importID(d.SenderPromise())
+		fmt.Fprintln(os.Stderr, fmt.Sprintf("recvCap senderPromise id=%v", id))
 		return c.addImport(id), nil
 	case rpccp.CapDescriptor_Which_thirdPartyHosted:
 		if c.network == nil {
@@ -1346,6 +1354,7 @@ func (c *lockedConn) recvCap(d rpccp.CapDescriptor) (capnp.Client, error) {
 				)
 			}
 			id := importID(thirdPartyDesc.VineId())
+			fmt.Fprintln(os.Stderr, fmt.Sprintf("recvCap thirdPartyHosted id=%v", id))
 			return c.addImport(id), nil
 		}
 		panic("TODO: 3PH")
@@ -1419,9 +1428,9 @@ func (c *lockedConn) recvCapReceiverAnswer(ans *ansent, transform []capnp.Pipeli
 	return iface.Client().AddRef()
 }
 
-// Returns whether the client should be treated as local, for the purpose of
-// embargoes.
-func (c *lockedConn) isLocalClient(client capnp.Client) bool {
+// Returns whether the client is "local," meaning it sends a Disembargo message
+// when a Resolve message is processed on this end.
+func (c *lockedConn) isClientThatSendsDisembargo(client capnp.Client) bool {
 	if (client == capnp.Client{}) {
 		return false
 	}
@@ -1430,11 +1439,11 @@ func (c *lockedConn) isLocalClient(client capnp.Client) bool {
 	defer snapshot.Release()
 	bv := snapshot.Brand().Value
 
-	if ic, ok := bv.(*importClient); ok {
-		if ic.c == (*Conn)(c) {
+	if imp, ok := bv.(*impent); ok {
+		if imp.c == (*Conn)(c) {
 			return false
 		}
-		if c.network == nil || c.network != ic.c.network {
+		if c.network == nil || c.network != imp.c.network {
 			// Different connections on different networks. We must
 			// be proxying it, so as far as this connection is
 			// concerned, it lives on our side.
@@ -1470,10 +1479,13 @@ func (c *lockedConn) isLocalClient(client capnp.Client) bool {
 
 // recvPayload extracts the content pointer after populating the
 // message's capability table.  It also returns the set of indices in
-// the capability table that represent capabilities in the local vat.
+// the capability table that represent capabilities in the local vat
+// (capabilities that send a Disembargo) - only used when handling a
+// Return message, where the Disembargoes are built from this set of
+// capability IDs. Disembargoes are otherwise sent in handleResolve().
 //
 // The caller must be holding onto c.lk.
-func (c *lockedConn) recvPayload(dq *deferred.Queue, payload rpccp.Payload) (_ capnp.Ptr, locals uintSet, _ error) {
+func (c *lockedConn) recvPayload(dq *deferred.Queue, payload rpccp.Payload) (_ capnp.Ptr, disembargoSenders uintSet, _ error) {
 	if !payload.IsValid() {
 		// null pointer; in this case we can treat the cap table as being empty
 		// and just return.
@@ -1513,12 +1525,12 @@ func (c *lockedConn) recvPayload(dq *deferred.Queue, payload rpccp.Payload) (_ c
 		}
 
 		mtab.Add(cl)
-		if c.isLocalClient(cl) {
-			locals.add(uint(i))
+		if c.isClientThatSendsDisembargo(cl) {
+			disembargoSenders.add(uint(i))
 		}
 	}
 
-	return p, locals, err
+	return p, disembargoSenders, err
 }
 
 func (c *Conn) handleRelease(ctx context.Context, in transport.IncomingMessage) error {
@@ -1585,13 +1597,13 @@ func (c *Conn) handleDisembargo(ctx context.Context, in transport.IncomingMessag
 		e.lift()
 
 	case rpccp.Disembargo_context_Which_senderLoopback:
-		var (
-			imp    *importClient
-			client capnp.Client
-		)
+		// Received a senderLoopback from the other end.
+		// Check that what it contains is valid, and then echo the embargoID back unmodified.
+		var client capnp.Client
 
 		c.withLocked(func(c *lockedConn) {
 			if tgt.which != rpccp.MessageTarget_Which_promisedAnswer {
+				// TODO: rpccp.MessageTarget_Which_importedCap
 				err = rpcerr.Failed(errors.New("incoming disembargo: sender loopback: target is not a promised answer"))
 				return
 			}
@@ -1656,14 +1668,13 @@ func (c *Conn) handleDisembargo(ctx context.Context, in transport.IncomingMessag
 
 		snapshot := client.Snapshot()
 		defer snapshot.Release()
-		imp, ok := snapshot.Brand().Value.(*importClient)
+		imp, ok := snapshot.Brand().Value.(*impent)
 		if !ok || imp.c != c {
 			client.Release()
 			return rpcerr.Failed(errors.New(
 				"incoming disembargo: sender loopback requested on a capability that is not an import",
 			))
 		}
-		// TODO(maybe): check generation?
 
 		// Since this Cap'n Proto RPC implementation does not send imports
 		// unless they are fully dequeued, we can just immediately loop back.
@@ -1718,6 +1729,92 @@ func (c *Conn) handleDisembargo(ctx context.Context, in transport.IncomingMessag
 	}
 
 	return nil
+}
+
+
+func (c *Conn) handleResolve(ctx context.Context, in transport.IncomingMessage) error {
+	resolve, err := in.Message().Resolve()
+	if err != nil {
+		in.Release()
+		c.er.ReportError(exc.WrapError("read resolve", err))
+		return nil
+	}
+
+	impID := importID(resolve.PromiseId())
+	err = withLockedConn1(c, func(c *lockedConn) error {
+		imp, ok := c.lk.imports[impID]
+		if !ok {
+			return fmt.Errorf("incoming resolve: no such import ID: %v", impID)
+		}
+
+		switch resolve.Which() {
+		case rpccp.Resolve_Which_exception:
+			imp.Shutdown()	// import senderPromise failed.
+			ex, err := resolve.Exception()
+			if err != nil {
+				err = exc.WrapError("reading exception from resolve message", err)
+			} else if reason, err2 := ex.Reason(); err2 != nil {
+				err = exc.Exception{
+					Type: exc.Type(ex.Type()),
+					Prefix: "failed to read Exception.Reason",
+					Cause: err2,
+				}
+			} else {
+				err = exc.New(exc.Type(ex.Type()), "", reason)
+			}
+			return err
+		case rpccp.Resolve_Which_cap:
+			fmt.Fprintln(os.Stderr, fmt.Sprintf("handleResolve: recvCap(%v)", resolve.String()))
+			break
+		}
+
+		desc, err := resolve.Cap()
+		if err != nil {
+			return exc.WrapError("reading cap from resolve message", err)
+		}
+		client, err := c.recvCap(desc)
+		if err != nil {
+			return err
+		}
+		defer client.Release()
+
+		// Resolve the imported Capability from senderPromise to an Interface. See rpc.capnp:
+		//
+		// > The sender promises that from this point forth, until `promiseId` is released, it shall
+		// > simply forward all messages to the capability designated by `cap`. This is true even if
+		// > `cap` itself happens to designate another promise, and that other promise later resolves --
+		// > messages sent to `promiseId` shall still go to that other promise, not to its resolution.
+		imp.resolveNow(ctx, client)
+
+		if !c.isClientThatSendsDisembargo(client) ||
+				desc.Which() != rpccp.CapDescriptor_Which_senderPromise {
+			return nil
+		}
+
+		var eid embargoID
+		// Wraps the current value of client ("the former client") with a new value (an embargo client)
+		// The senderLoopback here comes back as a receiverLoopback which will then call embargo.lift()
+		// on the CapabilityID in the former client (calls embargo.q.Fulfill()). That doesn't change
+		// impClient.resolveNow() above -- see rpc.capnp spec above -- so why send this Disembargo at
+		// all? To enforce E-order, quoting from rpc.capnp:
+		//
+		// > to ensure that all pipelined calls on the promise have been delivered.
+		eid, client = c.embargo(client)
+		sl := senderLoopback{
+			id: eid,
+			question: questionID(desc.SenderPromise()),
+		}
+		c.sendMessage(ctx, sl.buildDisembargo, func(err error) {
+			if err != nil {
+				c.er.ReportError(exc.WrapError("incoming resolve: send disembargo", err))
+			}
+		})
+		return nil
+	})
+	if err != nil {
+		c.er.ReportError(err)
+	}
+	return err
 }
 
 func (c *Conn) handleUnknownMessageType(ctx context.Context, in transport.IncomingMessage) {
